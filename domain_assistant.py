@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from dotenv import load_dotenv
-from openai import OpenAI, OpenAIError
+from openai import OpenAI, OpenAIError, RateLimitError
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
@@ -242,27 +242,70 @@ class TextGenerator(Protocol):
     def generate(self, prompt: str) -> str: ...
 
 
-class OpenAIGenerator:
-    def __init__(self, max_output_tokens: int = 300) -> None:
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        self.model = os.getenv("OPENAI_MODEL", "").strip()
+class GeminiGenerator:
+    def __init__(
+        self,
+        max_output_tokens: int = 300,
+        max_rate_limit_retries: int = 5,
+    ) -> None:
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.model = os.getenv("GEMINI_MODEL", "").strip() or "gemini-3.5-flash-lite"
         if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is missing from .env")
-        if not self.model:
-            raise RuntimeError("OPENAI_MODEL is missing from .env")
-        self.client = OpenAI(api_key=api_key)
+            raise RuntimeError("GEMINI_API_KEY is missing from .env")
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            max_retries=0,
+        )
         self.max_output_tokens = max_output_tokens
+        self.max_rate_limit_retries = max_rate_limit_retries
+
+    @staticmethod
+    def _rate_limit_delay(error: RateLimitError, attempt: int) -> float:
+        response = getattr(error, "response", None)
+        if response is not None:
+            retry_after = response.headers.get("retry-after")
+            if retry_after:
+                try:
+                    return max(1.0, float(retry_after) + 1.0)
+                except ValueError:
+                    pass
+
+        match = re.search(
+            r"please retry in\s+([0-9]+(?:\.[0-9]+)?)s",
+            str(error),
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return max(1.0, float(match.group(1)) + 1.0)
+        return min(60.0, 5.0 * (2**attempt))
 
     def generate(self, prompt: str) -> str:
-        response = self.client.responses.create(
-            model=self.model,
-            input=prompt,
-            temperature=0,
-            max_output_tokens=self.max_output_tokens,
-        )
-        answer = response.output_text.strip()
+        for attempt in range(self.max_rate_limit_retries + 1):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                    max_tokens=self.max_output_tokens,
+                )
+                break
+            except RateLimitError as error:
+                if attempt >= self.max_rate_limit_retries:
+                    raise
+                delay = self._rate_limit_delay(error, attempt)
+                print(
+                    "Gemini rate limit reached; "
+                    f"retrying in {delay:.1f}s "
+                    f"({attempt + 1}/{self.max_rate_limit_retries})...",
+                    flush=True,
+                )
+                time.sleep(delay)
+
+        content = response.choices[0].message.content if response.choices else None
+        answer = content.strip() if isinstance(content, str) else ""
         if not answer:
-            raise RuntimeError("OpenAI returned an empty answer")
+            raise RuntimeError("Gemini returned an empty answer")
         return answer
 
 
@@ -299,7 +342,7 @@ class DomainAssistant:
         return cls(
             corpus_id,
             BM25Retriever(chunks),
-            generator if generator is not None else OpenAIGenerator(),
+            generator if generator is not None else GeminiGenerator(),
             top_k,
         )
 
